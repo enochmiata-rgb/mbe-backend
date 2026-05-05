@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,7 +16,20 @@ from market_data_service import get_brent_price
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
+
 INTERNAL_KPI_SNAPSHOT_PATH = DATA_DIR / "internal_kpis.json"
+INTERNAL_KPI_EXCEL_PATH = DATA_DIR / "internal_kpis.xlsx"
+INTERNAL_KPI_CSV_PATH = DATA_DIR / "internal_kpis.csv"
+
+SUPPORTED_INTERNAL_KPI_KEYS = {
+    "production",
+    "revenue",
+    "treasury",
+    "capex",
+    "dividendsState",
+    "headcount",
+    "nationalProductionShare",
+}
 
 
 # =========================================================
@@ -76,16 +90,83 @@ def _safe_write_json(path: Path, payload: Dict[str, Any]) -> bool:
         return False
 
 
+def _normalize_key(value: Any) -> str:
+    raw = _safe_str(value)
+    if not raw:
+        return ""
+
+    aliases = {
+        "dividends_state": "dividendsState",
+        "dividends-state": "dividendsState",
+        "dividends state": "dividendsState",
+        "dividendstate": "dividendsState",
+        "dividendsstate": "dividendsState",
+        "dividendesetat": "dividendsState",
+        "dividendes_etat": "dividendsState",
+        "dividendes état": "dividendsState",
+        "national_production_share": "nationalProductionShare",
+        "national-production-share": "nationalProductionShare",
+        "national production share": "nationalProductionShare",
+        "part production nationale": "nationalProductionShare",
+        "part_production_nationale": "nationalProductionShare",
+        "production": "production",
+        "revenue": "revenue",
+        "revenus": "revenue",
+        "treasury": "treasury",
+        "tresorerie": "treasury",
+        "trésorerie": "treasury",
+        "capex": "capex",
+        "headcount": "headcount",
+        "effectifs": "headcount",
+    }
+
+    compact = raw.strip()
+    lowered = compact.lower()
+    normalized = lowered.replace("-", "_").replace(" ", "_")
+
+    if compact in SUPPORTED_INTERNAL_KPI_KEYS:
+        return compact
+
+    if lowered in aliases:
+        return aliases[lowered]
+
+    if normalized in aliases:
+        return aliases[normalized]
+
+    return compact
+
+
+def _normalize_header(value: Any) -> str:
+    text = _safe_str(value).lower()
+    text = text.replace("-", "_").replace(" ", "_")
+    text = text.replace("é", "e").replace("è", "e").replace("ê", "e")
+    text = text.replace("à", "a").replace("ç", "c")
+    return text
+
+
+def _safe_int_if_possible(value: Any) -> Any:
+    parsed = _safe_float(value)
+    if parsed is None:
+        return value
+
+    if float(parsed).is_integer():
+        return int(parsed)
+
+    return parsed
+
+
 def _find_snapshot_item(snapshot: Dict[str, Any], key: str) -> Optional[Dict[str, Any]]:
     items = snapshot.get("items", [])
     if not isinstance(items, list):
         return None
 
+    normalized_key = _normalize_key(key)
+
     for item in items:
         if not isinstance(item, dict):
             continue
 
-        if _safe_str(item.get("key")) == _safe_str(key):
+        if _normalize_key(item.get("key")) == normalized_key:
             return item
 
     return None
@@ -122,11 +203,236 @@ def _default_recommended_internal_source(key: str) -> str:
             "pour la production pays."
         ),
     }
-    return mapping.get(
-        key,
-        "Source métier interne à confirmer.",
-    )
+    return mapping.get(key, "Source métier interne à confirmer.")
 
+
+def _default_unit_for_key(key: str) -> str:
+    mapping = {
+        "production": "bpd",
+        "revenue": "xaf",
+        "treasury": "xaf",
+        "capex": "xaf",
+        "dividendsState": "xaf",
+        "headcount": "people",
+        "nationalProductionShare": "percent",
+    }
+    return mapping.get(key, "")
+
+
+def _default_provider_for_key(key: str) -> str:
+    mapping = {
+        "production": "Ops Control",
+        "revenue": "Finance",
+        "treasury": "Treasury",
+        "capex": "Investments",
+        "dividendsState": "Finance",
+        "headcount": "HR",
+        "nationalProductionShare": "Strategy",
+    }
+    return mapping.get(key, "Internal Source")
+
+
+def _default_status_for_key(key: str) -> str:
+    mapping = {
+        "production": "warning",
+        "revenue": "ok",
+        "treasury": "warning",
+        "capex": "warning",
+        "dividendsState": "ok",
+        "headcount": "ok",
+        "nationalProductionShare": "ok",
+    }
+    return mapping.get(key, "ok")
+
+
+def _default_title_for_key(key: str) -> str:
+    mapping = {
+        "production": "Production",
+        "revenue": "Revenus",
+        "treasury": "Trésorerie",
+        "capex": "CAPEX",
+        "dividendsState": "Dividendes État",
+        "headcount": "Effectifs",
+        "nationalProductionShare": "Part production nationale",
+    }
+    return mapping.get(key, key)
+
+
+def _default_value_for_key(key: str) -> Any:
+    mapping = {
+        "production": 320000,
+        "revenue": 2450000000000,
+        "treasury": 98000000000,
+        "capex": 420000000000,
+        "dividendsState": 165000000000,
+        "headcount": 2840,
+        "nationalProductionShare": 31,
+    }
+    return mapping.get(key, 0)
+
+
+def _is_valid_source_row(row: Dict[str, Any]) -> bool:
+    key = _normalize_key(row.get("key"))
+    if key not in SUPPORTED_INTERNAL_KPI_KEYS:
+        return False
+
+    value = _safe_float(row.get("value"))
+    return value is not None
+
+
+def _normalize_source_row(row: Dict[str, Any], source_path: Path) -> Optional[Dict[str, Any]]:
+    key = _normalize_key(row.get("key"))
+
+    if key not in SUPPORTED_INTERNAL_KPI_KEYS:
+        return None
+
+    value = _safe_int_if_possible(row.get("value"))
+    if _safe_float(value) is None:
+        return None
+
+    title = _default_title_for_key(key)
+    provider = _safe_str(row.get("provider"), _default_provider_for_key(key))
+    unit = _safe_str(row.get("unit"), _default_unit_for_key(key))
+    status = _safe_str(row.get("status"), _default_status_for_key(key))
+    as_of = _safe_str(row.get("asOf") or row.get("as_of"), _now_iso())
+    confidence = _safe_float(row.get("confidence"), 0.90) or 0.90
+    evidence = _safe_str(
+        row.get("evidence"),
+        f"KPI {title} chargé depuis la source métier {source_path.name}.",
+    )
+    source_url = _safe_str(row.get("sourceUrl") or row.get("source_url"), "")
+
+    return {
+        "key": key,
+        "value": value,
+        "unit": unit,
+        "provider": provider,
+        "asOf": as_of,
+        "confidence": confidence,
+        "status": status,
+        "evidence": evidence,
+        "sourceUrl": source_url,
+    }
+
+
+def _read_csv_rows(path: Path) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+
+    if not path.exists():
+        return rows
+
+    try:
+        with open(path, "r", encoding="utf-8-sig", newline="") as csv_file:
+            reader = csv.DictReader(csv_file)
+            if not reader.fieldnames:
+                return rows
+
+            for raw_row in reader:
+                normalized_row: Dict[str, Any] = {}
+                for raw_key, value in raw_row.items():
+                    normalized_row[_normalize_header(raw_key)] = value
+                rows.append(normalized_row)
+    except Exception as e:
+        print(f"[KPI_DATA_SERVICE] CSV READ ERROR: {e}")
+
+    return rows
+
+
+def _read_excel_rows(path: Path) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+
+    if not path.exists():
+        return rows
+
+    try:
+        from openpyxl import load_workbook
+    except Exception as e:
+        print(f"[KPI_DATA_SERVICE] OPENPYXL UNAVAILABLE: {e}")
+        return rows
+
+    try:
+        workbook = load_workbook(path, data_only=True, read_only=True)
+        worksheet = workbook.active
+
+        first_row = next(worksheet.iter_rows(min_row=1, max_row=1), None)
+        if first_row is None:
+            return rows
+
+        raw_headers = [_normalize_header(cell.value) for cell in first_row]
+
+        for excel_row in worksheet.iter_rows(min_row=2, values_only=True):
+            row: Dict[str, Any] = {}
+            for index, value in enumerate(excel_row):
+                if index >= len(raw_headers):
+                    continue
+
+                header = raw_headers[index]
+                if not header:
+                    continue
+
+                row[header] = value
+
+            if any(value is not None and _safe_str(value) for value in row.values()):
+                rows.append(row)
+    except Exception as e:
+        print(f"[KPI_DATA_SERVICE] EXCEL READ ERROR: {e}")
+
+    return rows
+
+
+def _source_file_to_snapshot(path: Path, source_type: str) -> Optional[Dict[str, Any]]:
+    if source_type == "excel":
+        rows = _read_excel_rows(path)
+    elif source_type == "csv":
+        rows = _read_csv_rows(path)
+    else:
+        rows = []
+
+    items: List[Dict[str, Any]] = []
+
+    for row in rows:
+        if not _is_valid_source_row(row):
+            continue
+
+        normalized = _normalize_source_row(row, path)
+        if normalized:
+            items.append(normalized)
+
+    if not items:
+        return None
+
+    return {
+        "updatedAt": _now_iso(),
+        "provider": f"internal_{source_type}",
+        "items": items,
+        "meta": {
+            "exists": True,
+            "sourceType": source_type,
+            "sourcePath": str(path),
+            "itemsCount": len(items),
+        },
+    }
+
+
+def _load_internal_source_snapshot() -> Optional[Dict[str, Any]]:
+    if INTERNAL_KPI_EXCEL_PATH.exists():
+        snapshot = _source_file_to_snapshot(INTERNAL_KPI_EXCEL_PATH, "excel")
+        if snapshot:
+            _safe_write_json(INTERNAL_KPI_SNAPSHOT_PATH, snapshot)
+            return snapshot
+
+    if INTERNAL_KPI_CSV_PATH.exists():
+        snapshot = _source_file_to_snapshot(INTERNAL_KPI_CSV_PATH, "csv")
+        if snapshot:
+            _safe_write_json(INTERNAL_KPI_SNAPSHOT_PATH, snapshot)
+            return snapshot
+
+    return None
+
+
+# =========================================================
+# KPI BUILDERS
+# =========================================================
 
 def _build_missing_internal_item(
     *,
@@ -160,6 +466,8 @@ def _build_missing_internal_item(
             "defaultProvider": provider,
             "defaultValue": default_value,
             "snapshotPath": str(INTERNAL_KPI_SNAPSHOT_PATH),
+            "excelPath": str(INTERNAL_KPI_EXCEL_PATH),
+            "csvPath": str(INTERNAL_KPI_CSV_PATH),
         },
     )
 
@@ -179,6 +487,8 @@ def _build_missing_internal_item(
     item["sourceStrategy"] = {
         "mode": "internal_required",
         "path": str(INTERNAL_KPI_SNAPSHOT_PATH),
+        "excelPath": str(INTERNAL_KPI_EXCEL_PATH),
+        "csvPath": str(INTERNAL_KPI_CSV_PATH),
         "recommendedInternalSource": recommended_source,
     }
     return item
@@ -220,6 +530,8 @@ def _build_internal_snapshot_item(
         metadata={
             "snapshotItem": snapshot_item,
             "snapshotPath": str(INTERNAL_KPI_SNAPSHOT_PATH),
+            "excelPath": str(INTERNAL_KPI_EXCEL_PATH),
+            "csvPath": str(INTERNAL_KPI_CSV_PATH),
         },
     )
 
@@ -238,6 +550,8 @@ def _build_internal_snapshot_item(
     item["sourceStrategy"] = {
         "mode": "internal_snapshot",
         "path": str(INTERNAL_KPI_SNAPSHOT_PATH),
+        "excelPath": str(INTERNAL_KPI_EXCEL_PATH),
+        "csvPath": str(INTERNAL_KPI_CSV_PATH),
         "recommendedInternalSource": recommended_source,
     }
     return item
@@ -333,6 +647,10 @@ def get_internal_kpi_snapshot_template() -> Dict[str, Any]:
     }
 
 
+def get_internal_kpi_excel_template_rows() -> List[Dict[str, Any]]:
+    return get_internal_kpi_snapshot_template()["items"]
+
+
 def write_internal_kpi_snapshot_template() -> Dict[str, Any]:
     template = get_internal_kpi_snapshot_template()
     ok = _safe_write_json(INTERNAL_KPI_SNAPSHOT_PATH, template)
@@ -340,12 +658,35 @@ def write_internal_kpi_snapshot_template() -> Dict[str, Any]:
     return {
         "ok": ok,
         "path": str(INTERNAL_KPI_SNAPSHOT_PATH),
+        "excelPath": str(INTERNAL_KPI_EXCEL_PATH),
+        "csvPath": str(INTERNAL_KPI_CSV_PATH),
         "templateWritten": ok,
         "snapshot": template if ok else None,
     }
 
 
 def load_internal_kpi_snapshot() -> Dict[str, Any]:
+    source_snapshot = _load_internal_source_snapshot()
+    if source_snapshot:
+        items = source_snapshot.get("items", [])
+        if not isinstance(items, list):
+            items = []
+
+        return {
+            "updatedAt": _safe_str(source_snapshot.get("updatedAt"), ""),
+            "provider": _safe_str(source_snapshot.get("provider"), "internal_source"),
+            "items": [item for item in items if isinstance(item, dict)],
+            "meta": {
+                "exists": True,
+                "path": str(INTERNAL_KPI_SNAPSHOT_PATH),
+                "excelPath": str(INTERNAL_KPI_EXCEL_PATH),
+                "csvPath": str(INTERNAL_KPI_CSV_PATH),
+                "sourceType": source_snapshot.get("meta", {}).get("sourceType", ""),
+                "sourcePath": source_snapshot.get("meta", {}).get("sourcePath", ""),
+                "itemsCount": len([item for item in items if isinstance(item, dict)]),
+            },
+        }
+
     snapshot = _safe_read_json(INTERNAL_KPI_SNAPSHOT_PATH)
 
     if not snapshot:
@@ -356,6 +697,8 @@ def load_internal_kpi_snapshot() -> Dict[str, Any]:
             "meta": {
                 "exists": False,
                 "path": str(INTERNAL_KPI_SNAPSHOT_PATH),
+                "excelPath": str(INTERNAL_KPI_EXCEL_PATH),
+                "csvPath": str(INTERNAL_KPI_CSV_PATH),
                 "itemsCount": 0,
             },
         }
@@ -371,6 +714,10 @@ def load_internal_kpi_snapshot() -> Dict[str, Any]:
         "meta": {
             "exists": True,
             "path": str(INTERNAL_KPI_SNAPSHOT_PATH),
+            "excelPath": str(INTERNAL_KPI_EXCEL_PATH),
+            "csvPath": str(INTERNAL_KPI_CSV_PATH),
+            "sourceType": "json",
+            "sourcePath": str(INTERNAL_KPI_SNAPSHOT_PATH),
             "itemsCount": len([item for item in items if isinstance(item, dict)]),
         },
     }
