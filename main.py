@@ -1528,10 +1528,7 @@ def _compact_kpi_item(item: Dict[str, Any]) -> Dict[str, Any]:
 
 def _compact_kpi_alert(alert: Dict[str, Any]) -> Dict[str, Any]:
     evidence = alert.get("evidence", [])
-    if isinstance(evidence, list):
-        compact_evidence = evidence[:3]
-    else:
-        compact_evidence = []
+    compact_evidence = evidence[:3] if isinstance(evidence, list) else []
 
     return {
         "kpi": alert.get("kpi"),
@@ -1642,43 +1639,207 @@ def _compact_kpi_source_registry(registry: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _compact_kpis_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    items = payload.get("items", [])
-    alerts = payload.get("alerts", [])
+def _merged_kpis_light_payload(limit: int = 10) -> Dict[str, Any]:
+    cache_key = _build_cache_key(
+        "merged_kpis_light_payload",
+        {
+            "limit": limit,
+        },
+    )
+    cached = _runtime_cache_get(cache_key)
+    if cached:
+        return cached
 
-    if not isinstance(items, list):
-        items = []
-    if not isinstance(alerts, list):
-        alerts = []
+    base_items = resolve_core_kpis()
+    kpi_registry = get_kpi_source_registry()
+    missing_internal_keys = set(get_missing_internal_kpi_keys())
 
-    compact_items = [_compact_kpi_item(item) for item in items if isinstance(item, dict)]
-    compact_alerts = [
-        _compact_kpi_alert(alert) for alert in alerts if isinstance(alert, dict)
+    registry_by_key = {
+        str(item.get("key")): item
+        for item in kpi_registry.get("items", [])
+        if isinstance(item, dict)
+    }
+
+    for item in base_items:
+        key = str(item.get("key", "")).strip()
+        source_strategy = registry_by_key.get(key, {})
+        item["sourceStrategy"] = source_strategy
+
+        if key in missing_internal_keys:
+            item["dataCollectionStatus"] = "internal_source_required"
+            item["recommendedInternalSource"] = source_strategy.get(
+                "recommendedInternalSource",
+                item.get("recommendedInternalSource", ""),
+            )
+            item["sourceGapEvidence"] = source_strategy.get(
+                "evidence",
+                item.get("sourceGapEvidence", ""),
+            )
+        else:
+            item["dataCollectionStatus"] = "sourced"
+
+    reliability_enriched = enrich_kpis_with_reliability(
+        kpis=base_items,
+        forecasts_payload=_assets_forecast_payload(),
+    )
+
+    realism_summary = build_kpi_realism_summary(reliability_enriched)
+    realism_by_key = {
+        str(item.get("key")): item.get("realism", {})
+        for item in realism_summary.get("items", [])
+        if isinstance(item, dict)
+    }
+
+    enriched_items: List[Dict[str, Any]] = []
+    for item in reliability_enriched:
+        decision_meta = _build_kpi_decision_metadata(
+            key=item["key"],
+            title=item["title"],
+            status=item["status"],
+            confidence=item["confidence"],
+            provider=item["provider"],
+            evidence=item["evidence"],
+        )
+
+        merged_item = {
+            **item,
+            **decision_meta,
+        }
+
+        merged_item["reliabilityScore"] = item.get("reliabilityScore")
+        merged_item["dataReliabilityLevel"] = item.get("dataReliabilityLevel")
+        merged_item["realism"] = realism_by_key.get(str(item.get("key")), {})
+
+        if "source" in item and isinstance(item["source"], dict):
+            merged_item["source"] = item["source"]
+
+        enriched_items.append(merged_item)
+
+    cross_kpi_validation = validate_cross_kpis(enriched_items)
+
+    alerts: List[Dict[str, Any]] = [
+        {
+            "kpi": "treasury",
+            "severity": "warning",
+            "message": "La trésorerie reste sous le seuil de confort court terme.",
+            "riskLevel": "medium",
+            "decisionImpact": (
+                "Risque de tension sur décaissements prioritaires "
+                "et arbitrages court terme."
+            ),
+            "decisionRecommendation": (
+                "Mettre en place un comité trésorerie hebdomadaire "
+                "et un plan de tension."
+            ),
+            "evidence": [],
+        }
     ]
 
-    return {
-        "updatedAt": payload.get("updatedAt", _now_iso()),
+    for issue in cross_kpi_validation.get("topIssues", []):
+        if not isinstance(issue, dict):
+            continue
+        alerts.append(
+            {
+                "kpi": issue.get("id", ""),
+                "severity": issue.get("severity", "warning"),
+                "message": issue.get("message", ""),
+                "riskLevel": issue.get("severity", "medium"),
+                "decisionImpact": issue.get("title", ""),
+                "decisionRecommendation": issue.get("recommendation", ""),
+                "evidence": issue.get("evidence", []),
+            }
+        )
+
+    for item in kpi_registry.get("items", []):
+        if not isinstance(item, dict):
+            continue
+        if item.get("status") not in {
+            "missing_internal_source",
+            "missing_hybrid_source",
+        }:
+            continue
+
+        alerts.append(
+            {
+                "kpi": item.get("key", ""),
+                "severity": "warning",
+                "message": (
+                    f"Source métier manquante pour "
+                    f"{item.get('title', item.get('key', 'KPI'))}."
+                ),
+                "riskLevel": "medium",
+                "decisionImpact": item.get("evidence", ""),
+                "decisionRecommendation": item.get("recommendedInternalSource", ""),
+                "evidence": [item.get("provider", ""), item.get("sourceMode", "")],
+            }
+        )
+
+    for item in enriched_items:
+        realism = item.get("realism", {}) if isinstance(item.get("realism"), dict) else {}
+        band = str(realism.get("band", "")).strip().lower()
+        label = str(realism.get("label", "")).strip().lower()
+
+        if band not in {"weak", "low"} and label not in {
+            "fallback",
+            "internal_source_required",
+        }:
+            continue
+
+        alerts.append(
+            {
+                "kpi": item.get("key", ""),
+                "severity": "warning",
+                "message": (
+                    f"Réalisme limité pour le KPI {item.get('title', item.get('key', 'KPI'))}."
+                ),
+                "riskLevel": "medium",
+                "decisionImpact": (
+                    f"Lecture exécutive à manier avec prudence "
+                    f"(score réalisme {realism.get('score', 0)}/100)."
+                ),
+                "decisionRecommendation": (
+                    item.get("recommendedInternalSource", "")
+                    or "Renforcer la qualité de source avant arbitrage exécutif."
+                ),
+                "evidence": [
+                    f"realism_label={realism.get('label', '')}",
+                    f"realism_band={realism.get('band', '')}",
+                ],
+            }
+        )
+
+    compact_payload = {
+        "updatedAt": _now_iso(),
         "mode": "light",
-        "items": compact_items,
-        "alerts": compact_alerts,
+        "items": [
+            _compact_kpi_item(item)
+            for item in enriched_items[:limit]
+            if isinstance(item, dict)
+        ],
+        "alerts": [
+            _compact_kpi_alert(alert)
+            for alert in alerts
+            if isinstance(alert, dict)
+        ],
         "summary": {
-            "kpiCount": len(compact_items),
-            "alertCount": len(compact_alerts),
-            "missingInternalKpiCount": len(payload.get("missingInternalKpiKeys", [])),
-            "status": payload.get("crossKpiValidation", {}).get("overallStatus"),
+            "kpiCount": len(enriched_items[:limit]),
+            "alertCount": len(alerts),
+            "missingInternalKpiCount": len(missing_internal_keys),
+            "status": cross_kpi_validation.get("overallStatus"),
         },
-        "crossKpiValidation": _compact_cross_kpi_validation(
-            payload.get("crossKpiValidation", {})
-        ),
-        "missingInternalKpiKeys": payload.get("missingInternalKpiKeys", []),
-        "kpiRealismSummary": _compact_kpi_realism_summary(
-            payload.get("kpiRealismSummary", {})
-        ),
-        "kpiSourceRegistry": _compact_kpi_source_registry(
-            payload.get("kpiSourceRegistry", {})
-        ),
-        "internalSnapshotMeta": payload.get("internalSnapshotMeta", {}),
+        "crossKpiValidation": _compact_cross_kpi_validation(cross_kpi_validation),
+        "missingInternalKpiKeys": list(missing_internal_keys),
+        "kpiRealismSummary": _compact_kpi_realism_summary(realism_summary),
+        "kpiSourceRegistry": _compact_kpi_source_registry(kpi_registry),
+        "internalSnapshotMeta": load_internal_kpi_snapshot().get("meta", {}),
     }
+
+    _runtime_cache_set(
+        cache_key,
+        compact_payload,
+        ttl_seconds=KPI_PAYLOAD_CACHE_TTL_SECONDS,
+    )
+    return compact_payload
 
 
 # =========================================================
@@ -3084,7 +3245,7 @@ def init_internal_kpis() -> Dict[str, Any]:
 
 @app.get("/api/kpis")
 def get_kpis() -> Dict[str, Any]:
-    return _compact_kpis_payload(_merged_kpis_payload())
+    return _merged_kpis_light_payload()
 
 
 @app.get("/api/kpis/full")
@@ -3094,6 +3255,82 @@ def get_kpis_full() -> Dict[str, Any]:
 
 @app.get("/api/kpis/drilldown/{key}")
 def kpi_drilldown(key: str) -> Dict[str, Any]:
+    if key == "brent":
+        snapshot = get_brent_market_snapshot()
+        current = snapshot.get("current", {})
+        history = snapshot.get("history", [])
+        providers_state = snapshot.get("providersState", {})
+
+        return {
+            "key": "brent",
+            "summary": (
+                "Lecture détaillée du KPI Brent avec qualité de source, "
+                "historique et agrégation multi-provider."
+            ),
+            "current": current,
+            "history": history,
+            "sources": [
+                {
+                    "label": current.get("provider", "Unknown Provider"),
+                    "note": current.get("evidence", ""),
+                    "url": current.get("sourceUrl", ""),
+                    "sourceType": current.get("sourceMode", ""),
+                    "dataReliabilityLevel": current.get("status", ""),
+                    "reliabilityScore": int(
+                        round(float(current.get("confidence", 0) or 0) * 100)
+                    ),
+                }
+            ],
+            "relatedDocuments": [],
+            "relatedCrossChecks": [],
+            "attentionPoints": [
+                "Vérifier si la donnée provient de FMP, Yahoo ou d’un fallback.",
+                "Surveiller le spread inter-sources avant arbitrage exécutif.",
+                "Confirmer la stabilité de la cotation avant usage COMEX/PCA.",
+            ],
+            "decisionImpact": (
+                "Impact direct sur recettes export, arbitrages commerciaux "
+                "et hypothèses budgétaires."
+            ),
+            "decisionRecommendation": (
+                "Utiliser en priorité la cotation agrégée live et surveiller "
+                "toute dégradation de source."
+            ),
+            "riskLevel": "medium" if current.get("status") == "degraded" else "low",
+            "dataReliabilityLevel": current.get("status", "watch"),
+            "reliabilityScore": int(
+                round(float(current.get("confidence", 0) or 0) * 100)
+            ),
+            "sourceSystem": current.get("provider", ""),
+            "sourceType": current.get("sourceMode", ""),
+            "lastValidationAt": current.get("asOf", ""),
+            "validationNotes": [
+                current.get("evidence", ""),
+            ],
+            "source": current.get("raw", {}),
+            "sourceStrategy": {
+                "mode": current.get("sourceMode", ""),
+                "providersState": providers_state,
+            },
+            "dataCollectionStatus": "sourced" if current.get("isLive") else "fallback",
+            "recommendedInternalSource": "",
+            "sourceGapEvidence": "",
+            "realism": {
+                "label": "live" if current.get("isLive") else "fallback",
+                "score": int(round(float(current.get("confidence", 0) or 0) * 100)),
+                "band": (
+                    "high"
+                    if float(current.get("confidence", 0) or 0) >= 0.85
+                    else "medium"
+                ),
+            },
+            "reliabilityEngine": {
+                "providersState": providers_state,
+                "aggregation": current.get("raw", {}).get("aggregation", {}),
+            },
+            "crossKpiValidation": {},
+        }
+
     payload = _merged_kpis_payload(limit=20)
     items = payload["items"]
     current = next((item for item in items if item.get("key") == key), None)
@@ -3763,84 +4000,6 @@ def strategy_simulate(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-@app.get("/api/kpis/drilldown/brent")
-def brent_drilldown() -> Dict[str, Any]:
-    snapshot = get_brent_market_snapshot()
-    current = snapshot.get("current", {})
-    history = snapshot.get("history", [])
-    providers_state = snapshot.get("providersState", {})
-
-    return {
-        "key": "brent",
-        "summary": (
-            "Lecture détaillée du KPI Brent avec qualité de source, "
-            "historique et agrégation multi-provider."
-        ),
-        "current": current,
-        "history": history,
-        "sources": [
-            {
-                "label": current.get("provider", "Unknown Provider"),
-                "note": current.get("evidence", ""),
-                "url": current.get("sourceUrl", ""),
-                "sourceType": current.get("sourceMode", ""),
-                "dataReliabilityLevel": current.get("status", ""),
-                "reliabilityScore": int(
-                    round(float(current.get("confidence", 0) or 0) * 100)
-                ),
-            }
-        ],
-        "relatedDocuments": [],
-        "relatedCrossChecks": [],
-        "attentionPoints": [
-            "Vérifier si la donnée provient de FMP, Yahoo ou d’un fallback.",
-            "Surveiller le spread inter-sources avant arbitrage exécutif.",
-            "Confirmer la stabilité de la cotation avant usage COMEX/PCA.",
-        ],
-        "decisionImpact": (
-            "Impact direct sur recettes export, arbitrages commerciaux "
-            "et hypothèses budgétaires."
-        ),
-        "decisionRecommendation": (
-            "Utiliser en priorité la cotation agrégée live et surveiller "
-            "toute dégradation de source."
-        ),
-        "riskLevel": "medium" if current.get("status") == "degraded" else "low",
-        "dataReliabilityLevel": current.get("status", "watch"),
-        "reliabilityScore": int(
-            round(float(current.get("confidence", 0) or 0) * 100)
-        ),
-        "sourceSystem": current.get("provider", ""),
-        "sourceType": current.get("sourceMode", ""),
-        "lastValidationAt": current.get("asOf", ""),
-        "validationNotes": [
-            current.get("evidence", ""),
-        ],
-        "source": current.get("raw", {}),
-        "sourceStrategy": {
-            "mode": current.get("sourceMode", ""),
-            "providersState": providers_state,
-        },
-        "dataCollectionStatus": "sourced" if current.get("isLive") else "fallback",
-        "recommendedInternalSource": "",
-        "sourceGapEvidence": "",
-        "realism": {
-            "label": "live" if current.get("isLive") else "fallback",
-            "score": int(round(float(current.get("confidence", 0) or 0) * 100)),
-            "band": (
-                "high"
-                if float(current.get("confidence", 0) or 0) >= 0.85
-                else "medium"
-            ),
-        },
-        "reliabilityEngine": {
-            "providersState": providers_state,
-            "aggregation": current.get("raw", {}).get("aggregation", {}),
-        },
-        "crossKpiValidation": {},
-    }
-
-
 # =========================================================
 # ENTRYPOINT (LOCAL / RENDER)
 # =========================================================
@@ -3854,4 +4013,3 @@ if __name__ == "__main__":
         port=int(os.environ.get("PORT", 8000)),
         reload=False,
     )
-
