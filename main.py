@@ -3094,6 +3094,82 @@ def get_kpis_full() -> Dict[str, Any]:
 
 @app.get("/api/kpis/drilldown/{key}")
 def kpi_drilldown(key: str) -> Dict[str, Any]:
+    if key == "brent":
+        snapshot = get_brent_market_snapshot()
+        current = snapshot.get("current", {})
+        history = snapshot.get("history", [])
+        providers_state = snapshot.get("providersState", {})
+
+        return {
+            "key": "brent",
+            "summary": (
+                "Lecture détaillée du KPI Brent avec qualité de source, "
+                "historique et agrégation multi-provider."
+            ),
+            "current": current,
+            "history": history,
+            "sources": [
+                {
+                    "label": current.get("provider", "Unknown Provider"),
+                    "note": current.get("evidence", ""),
+                    "url": current.get("sourceUrl", ""),
+                    "sourceType": current.get("sourceMode", ""),
+                    "dataReliabilityLevel": current.get("status", ""),
+                    "reliabilityScore": int(
+                        round(float(current.get("confidence", 0) or 0) * 100)
+                    ),
+                }
+            ],
+            "relatedDocuments": [],
+            "relatedCrossChecks": [],
+            "attentionPoints": [
+                "Vérifier si la donnée provient de FMP, Yahoo ou d’un fallback.",
+                "Surveiller le spread inter-sources avant arbitrage exécutif.",
+                "Confirmer la stabilité de la cotation avant usage COMEX/PCA.",
+            ],
+            "decisionImpact": (
+                "Impact direct sur recettes export, arbitrages commerciaux "
+                "et hypothèses budgétaires."
+            ),
+            "decisionRecommendation": (
+                "Utiliser en priorité la cotation agrégée live et surveiller "
+                "toute dégradation de source."
+            ),
+            "riskLevel": "medium" if current.get("status") == "degraded" else "low",
+            "dataReliabilityLevel": current.get("status", "watch"),
+            "reliabilityScore": int(
+                round(float(current.get("confidence", 0) or 0) * 100)
+            ),
+            "sourceSystem": current.get("provider", ""),
+            "sourceType": current.get("sourceMode", ""),
+            "lastValidationAt": current.get("asOf", ""),
+            "validationNotes": [
+                current.get("evidence", ""),
+            ],
+            "source": current.get("raw", {}),
+            "sourceStrategy": {
+                "mode": current.get("sourceMode", ""),
+                "providersState": providers_state,
+            },
+            "dataCollectionStatus": "sourced" if current.get("isLive") else "fallback",
+            "recommendedInternalSource": "",
+            "sourceGapEvidence": "",
+            "realism": {
+                "label": "live" if current.get("isLive") else "fallback",
+                "score": int(round(float(current.get("confidence", 0) or 0) * 100)),
+                "band": (
+                    "high"
+                    if float(current.get("confidence", 0) or 0) >= 0.85
+                    else "medium"
+                ),
+            },
+            "reliabilityEngine": {
+                "providersState": providers_state,
+                "aggregation": current.get("raw", {}).get("aggregation", {}),
+            },
+            "crossKpiValidation": {},
+        }
+
     payload = _merged_kpis_payload(limit=20)
     items = payload["items"]
     current = next((item for item in items if item.get("key") == key), None)
@@ -3509,15 +3585,27 @@ async def remove_from_board_pack(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 @app.post("/api/assistant")
 async def assistant(payload: Dict[str, Any]) -> Dict[str, Any]:
-    question = str(payload.get("question", "")).strip() or "Question non fournie"
-    return {
-        "answer": f"Réponse assistant standard pour : {question}",
-        "confidence": 0.8,
-        "meta": {
-            "mode": "standard",
-            "generatedAt": _now_iso(),
-        },
-    }
+    question = str(payload.get("question", "")).strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="La question est obligatoire.")
+
+    top_k = _safe_int(payload.get("topK"), 5)
+    use_rag = bool(payload.get("useRag", True))
+    use_web = bool(payload.get("useWeb", True))
+    mode = str(payload.get("mode", "standard")).strip() or "standard"
+    conversation = payload.get("conversation", [])
+    if not isinstance(conversation, list):
+        conversation = []
+
+    return _build_assistant_answer(
+        question=question,
+        use_rag=use_rag,
+        use_web=use_web,
+        top_k=top_k,
+        conversation=conversation,
+        request_id=_generate_request_id(),
+        mode=mode,
+    )
 
 
 @app.post("/api/assistant/rag")
@@ -3854,3 +3942,4 @@ if __name__ == "__main__":
         port=int(os.environ.get("PORT", 8000)),
         reload=False,
     )
+
